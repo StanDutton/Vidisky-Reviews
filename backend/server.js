@@ -109,21 +109,52 @@ function normalizeReviews(payload) {
   return uniq;
 }
 
-// ---- polling helper for results_location (handles long jobs) ----
-async function pollOutscraper(requestUrl, headers, { maxWaitMs = 120000, intervalMs = 2000 } = {}) {
+// ---- fetch JSON with key, return parsed or null ----
+async function fetchJson(url, headers) {
+  const r = await fetch(url, { headers });
+  const text = await r.text();
+  try { return JSON.parse(text); } catch { return null; }
+}
+
+// ---- try multiple result URLs and download links until data appears ----
+async function fetchResultsUntilData(baseUrl, headers, { maxWaitMs = 120000, intervalMs = 2000 } = {}) {
   const started = Date.now();
   let lastJson = null;
 
   while (Date.now() - started < maxWaitMs) {
-    const r = await fetch(requestUrl, { headers });
-    const text = await r.text();
-    let json = null; try { json = JSON.parse(text); } catch {}
-    lastJson = json;
+    // 1) Try base URL
+    let json = await fetchJson(baseUrl, headers);
+    if (json) {
+      lastJson = json;
+      if (hasReviewData(json)) return json;
 
-    if (hasReviewData(json)) return json;
+      // If it exposes alternate locations or downloadable links, try them
+      const links = []
+        .concat(json?.results_location || [])
+        .concat(json?.resultsLocation || [])
+        .concat(json?.result_url || [])
+        .concat(json?.results_url || [])
+        .concat(json?.file_url || [])
+        .concat(json?.download_url || [])
+        .concat(Array.isArray(json?.links) ? json.links : []);
 
-    const s = String(json?.status || "").toLowerCase();
-    if (s === "error" || s === "failed") return json; // don’t loop forever
+      // 2) If there is a /results variant, try it
+      const resultsVariant = baseUrl.endsWith("/results") ? baseUrl : `${baseUrl.replace(/\/$/, "")}/results`;
+      links.push(resultsVariant);
+
+      for (const link of links.filter(Boolean)) {
+        const alt = typeof link === "string" ? link : link.url || link.href;
+        if (!alt) continue;
+        const j2 = await fetchJson(alt, headers);
+        if (j2) {
+          lastJson = j2;
+          if (hasReviewData(j2)) return j2;
+
+          // Some files come as { file_url: "https://..." } that returns array directly
+          if (Array.isArray(j2) && j2.length) return j2;
+        }
+      }
+    }
 
     await new Promise((res) => setTimeout(res, intervalMs));
   }
@@ -166,10 +197,7 @@ app.get("/google-reviews/start", async (req, res) => {
       json?.resultsLocation ||
       (id ? `https://api.outscraper.cloud/requests/${id}` : null);
 
-    if (!results_location) {
-      return res.status(202).json({ status: "Pending", id });
-    }
-    res.status(202).json({ status: "Pending", id, results_location });
+    return res.status(202).json({ status: "Pending", id, results_location });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "google-reviews/start failed" });
@@ -188,9 +216,9 @@ app.get("/google-reviews/result", async (req, res) => {
       return res.status(400).json({ error: "OUTSCRAPER_API_KEY missing on server" });
     }
     const headers = { "X-API-KEY": OUTSCRAPER_API_KEY };
-    const url = results_location || `https://api.outscraper.cloud/requests/${id}`;
+    const base = results_location || `https://api.outscraper.cloud/requests/${id}`;
 
-    const payload = await pollOutscraper(url, headers);
+    const payload = await fetchResultsUntilData(base, headers);
     if (!payload) return res.status(202).json({ status: "Pending" });
 
     if (!hasReviewData(payload)) return res.json([]); // success but no data
@@ -213,7 +241,6 @@ app.get("/google-reviews", async (req, res) => {
 
     if (!OUTSCRAPER_API_KEY) return res.json([]);
 
-    // try cache first by firing start, then quick poll
     const headers = { "X-API-KEY": OUTSCRAPER_API_KEY };
     const startUrl =
       `https://api.app.outscraper.com/maps/reviews?` +
@@ -239,7 +266,6 @@ app.get("/google-reviews", async (req, res) => {
       return res.json(reviews);
     }
 
-    // brief poll (8s) for synchronous-ish experience
     const resultsUrl =
       startJson?.results_location ||
       startJson?.resultsLocation ||
@@ -247,14 +273,13 @@ app.get("/google-reviews", async (req, res) => {
 
     if (!resultsUrl) return res.status(202).json({ status: "Pending" });
 
-    const payload = await pollOutscraper(resultsUrl, headers, { maxWaitMs: 8000, intervalMs: 1500 });
+    const payload = await fetchResultsUntilData(resultsUrl, headers, { maxWaitMs: 8000, intervalMs: 1500 });
     if (hasReviewData(payload)) {
       const reviews = normalizeReviews(payload);
       setCache(cacheKey, reviews);
       return res.json(reviews);
     }
 
-    // not ready yet → tell the client how to poll
     return res.status(202).json({
       status: "Pending",
       id: startJson?.id || null,
@@ -365,46 +390,44 @@ app.get("/env-check", (req, res) => {
   });
 });
 
-app.get("/debug-google", async (req, res) => {
+// Show what the results URL(s) are returning right now
+app.get("/debug-google-result", async (req, res) => {
   try {
-    const name = required(req.query, "name");
-    const location = required(req.query, "location");
-
-    if (!process.env.OUTSCRAPER_API_KEY) {
+    const id = (req.query.id || "").trim();
+    const url = (req.query.url || "").trim();
+    if (!id && !url) {
+      return res.status(400).json({ error: "Provide ?id=... or ?url=..." });
+    }
+    if (!OUTSCRAPER_API_KEY) {
       return res.status(400).json({ error: "OUTSCRAPER_API_KEY missing on server" });
     }
+    const headers = { "X-API-KEY": OUTSCRAPER_API_KEY };
+    const base = url || `https://api.outscraper.cloud/requests/${id}`;
 
-    const requestUrl =
-      `https://api.app.outscraper.com/maps/reviews?` +
-      new URLSearchParams({
-        query: `${name} ${location}`,
-        reviewsLimit: "10",
-        reviewsSort: "newest",
-        language: "en",
-      }).toString();
+    const tryUrls = [
+      base,
+      `${base.replace(/\/$/, "")}/results`
+    ];
 
-    const resp = await fetch(requestUrl, {
-      headers: { "X-API-KEY": process.env.OUTSCRAPER_API_KEY },
-    });
-
-    const contentType = resp.headers.get("content-type") || "";
-    let bodyText = await resp.text();
-    let parsed = null;
-    try { parsed = JSON.parse(bodyText); } catch {}
-
-    res.status(resp.status).json({
-      ok: resp.ok,
-      status: resp.status,
-      contentType,
-      requestUrl,
-      bodyPreview: bodyText.slice(0, 2000),
-      jsonType: parsed && (Array.isArray(parsed) ? "array" : typeof parsed),
-      jsonLength: parsed && (Array.isArray(parsed) ? parsed.length : undefined),
-      jsonKeys: parsed && !Array.isArray(parsed) ? Object.keys(parsed) : undefined,
-    });
+    const results = [];
+    for (const u of tryUrls) {
+      const r = await fetch(u, { headers });
+      const text = await r.text();
+      let json = null; try { json = JSON.parse(text); } catch {}
+      results.push({
+        url: u,
+        status: r.status,
+        hasData: hasReviewData(json),
+        preview: text.slice(0, 1200),
+        keys: json && !Array.isArray(json) ? Object.keys(json) : undefined,
+        isArray: Array.isArray(json),
+        length: Array.isArray(json) ? json.length : undefined
+      });
+    }
+    res.json({ tried: results });
   } catch (e) {
     console.error(e);
-    res.status(500).json({ error: "debug-google failed", message: e.message });
+    res.status(500).json({ error: "debug-google-result failed", message: e.message });
   }
 });
 
