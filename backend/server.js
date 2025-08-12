@@ -4,14 +4,13 @@
 import express from "express";
 import fetch from "node-fetch";
 import cors from "cors";
-import { load } from "cheerio"; // correct ESM import for cheerio
+import { load } from "cheerio";
 
 const app = express();
-// In prod, restrict to your frontend: app.use(cors({ origin: "https://YOUR-APP.vercel.app" }));
 app.use(cors());
 app.use(express.json());
 
-// ----- config / helpers -----
+// ---------- config / helpers ----------
 const OUTSCRAPER_API_KEY =
   process.env.OUTSCRAPER_API_KEY || process.env.OUTSCRAPER_KEY;
 
@@ -40,8 +39,32 @@ function required(q, name) {
   return v;
 }
 
-// --- helper: poll Outscraper results until ready (handles 202 Pending) ---
-async function pollOutscraper(requestUrl, headers, { maxWaitMs = 25000, intervalMs = 1500 } = {}) {
+// ---- helper: detect if Outscraper JSON actually contains review data ----
+function hasReviewData(json) {
+  if (!json) return false;
+  if (Array.isArray(json)) return json.length > 0;
+
+  const arrays = [
+    json.data,
+    json.results,
+    json.reviews,
+    json.reviews_data,
+  ].filter(Array.isArray);
+
+  if (arrays.some((a) => a.length > 0)) return true;
+
+  // some payloads: { items: [{ reviews_data:[...] }, ...] }
+  if (Array.isArray(json.items)) {
+    for (const it of json.items) {
+      if (Array.isArray(it?.reviews_data) && it.reviews_data.length > 0) return true;
+      if (Array.isArray(it?.reviews) && it.reviews.length > 0) return true;
+    }
+  }
+  return false;
+}
+
+// ---- helper: poll Outscraper results until ready (handles 202 + Pending) ----
+async function pollOutscraper(requestUrl, headers, { maxWaitMs = 60000, intervalMs = 1500 } = {}) {
   const started = Date.now();
   let lastJson = null;
 
@@ -49,16 +72,25 @@ async function pollOutscraper(requestUrl, headers, { maxWaitMs = 25000, interval
     const r = await fetch(requestUrl, { headers });
     const text = await r.text();
     let json = null;
-    try { json = JSON.parse(text); } catch { /* non-JSON */ }
+    try { json = JSON.parse(text); } catch { /* ignore parse error */ }
     lastJson = json;
 
-    // When ready, Outscraper typically returns 200 with data
-    if (r.status === 200) return json;
-    if (json && (json.status === "Success" || json.status === "Done")) return json;
+    // Only return when we actually see data
+    if (hasReviewData(json)) return json;
 
+    // If explicitly marked success/done but no data, still return (we'll normalize to [])
+    if (json && typeof json === "object") {
+      const s = String(json.status || "").toLowerCase();
+      if (s === "success" || s === "done" || s === "ok" || s === "completed") {
+        return json;
+      }
+    }
+
+    // Otherwise keep waiting (still pending)
     await new Promise((res) => setTimeout(res, intervalMs));
   }
-  return lastJson; // return whatever we last saw (for debugging)
+  // timeout: return whatever we last saw
+  return lastJson;
 }
 
 // -----------------------------------------------------------------------------
@@ -100,29 +132,22 @@ app.get("/google-reviews", async (req, res) => {
 
     let finalJson = null;
 
-    // 2) If immediate data returned, use it
-    if (
-      Array.isArray(triggerJson) ||
-      (triggerJson && (triggerJson.data || triggerJson.results || triggerJson.reviews || triggerJson.reviews_data))
-    ) {
+    // 2) Immediate data (rare)
+    if (hasReviewData(triggerJson)) {
       finalJson = triggerJson;
     } else {
-      // 3) Otherwise poll the results_location (202 Pending case)
+      // 3) Poll results_location (typical for 202 Pending)
       const resultsUrl =
         triggerJson?.results_location ||
         triggerJson?.resultsLocation ||
         triggerJson?.result_url ||
-        null;
+        (triggerJson?.id ? `https://api.outscraper.cloud/requests/${triggerJson.id}` : null);
 
-      if (resultsUrl) {
-        finalJson = await pollOutscraper(resultsUrl, headers);
-      } else if (triggerJson?.id) {
-        // Fallback pattern if only id returned
-        finalJson = await pollOutscraper(`https://api.outscraper.cloud/requests/${triggerJson.id}`, headers);
-      } else {
-        // Nothing else we can do
+      if (!resultsUrl) {
+        console.warn("[WARN] No results_location or id returned by Outscraper trigger.");
         return res.json([]);
       }
+      finalJson = await pollOutscraper(resultsUrl, headers);
     }
 
     // 4) Normalize to [{ text, url }]
@@ -146,6 +171,7 @@ app.get("/google-reviews", async (req, res) => {
     if (finalJson?.data) blocks.push(...finalJson.data);
     if (finalJson?.results) blocks.push(...finalJson.results);
     if (!blocks.length && (finalJson?.reviews_data || finalJson?.reviews)) blocks.push(finalJson);
+    if (!blocks.length && Array.isArray(finalJson?.items)) blocks.push(...finalJson.items);
 
     for (const block of blocks) {
       const placeUrl = block?.url || block?.place_link || "";
