@@ -8,20 +8,17 @@ import { load } from "cheerio";
 import { chromium, devices } from "playwright";
 
 const app = express();
-app.use(cors());
+app.use(cors());            // In prod, restrict to your frontend origin
 app.use(express.json());
 
-// ---------- tiny cache ----------
+// ---------------- tiny in-memory cache ----------------
 const cache = new Map();
-const TTL_MS = 1000 * 60 * 60 * 6; // 6h cache
+const TTL_MS = 1000 * 60 * 60 * 6; // 6 hours
 
 const getCache = (k) => {
   const x = cache.get(k);
   if (!x) return null;
-  if (Date.now() - x.ts > TTL_MS) {
-    cache.delete(k);
-    return null;
-  }
+  if (Date.now() - x.ts > TTL_MS) { cache.delete(k); return null; }
   return x.v;
 };
 const setCache = (k, v) => cache.set(k, { ts: Date.now(), v });
@@ -36,19 +33,20 @@ function required(q, name) {
   return v;
 }
 
-// ============================================================================
-// GOOGLE MAPS SCRAPER (Playwright)
-// ============================================================================
-
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
+// ============================================================================
+// GOOGLE MAPS SCRAPER (Playwright) – /google-scrape
+// ============================================================================
 /**
- * scrapeGoogleReviews
- * - Opens Google Maps for "{name} {location}"
- * - Clicks first result → "All reviews"
- * - Sorts by "Newest" (if available)
- * - Scrolls to load up to maxReviews
- * - Returns [{ text, url }]
+ * Scrapes Google Maps reviews for "{name} {location}"
+ * Steps:
+ * 1) Open Maps search for the query
+ * 2) Click first result
+ * 3) Click "All reviews"
+ * 4) (If available) set sort to "Newest"
+ * 5) Scroll the reviews panel to load more
+ * Returns: [{ text, url }]
  */
 async function scrapeGoogleReviews({ name, location, maxReviews = 80, timeoutMs = 90000 }) {
   const start = Date.now();
@@ -65,7 +63,7 @@ async function scrapeGoogleReviews({ name, location, maxReviews = 80, timeoutMs 
   const context = await browser.newContext({
     ...devices["Desktop Chrome"],
     locale: "en-US",
-    geolocation: { latitude: 27.4989, longitude: -82.5748 }, // arbitrary; helps Maps load
+    geolocation: { latitude: 27.4989, longitude: -82.5748 }, // arbitrary; helps Maps load quickly
     permissions: ["geolocation"],
     userAgent:
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"
@@ -80,18 +78,18 @@ async function scrapeGoogleReviews({ name, location, maxReviews = 80, timeoutMs 
     // 1) Open search
     await page.goto(mapsSearch, { waitUntil: "domcontentloaded", timeout: 45000 });
 
-    // 2) Click first result in left panel (robust-ish selectors)
+    // 2) Click the first left-panel result (handle a couple of DOM variants)
     const firstCard = page.locator('a[data-result-id]:has(h3), a.hfpxzc');
     await firstCard.first().click({ timeout: 20000 });
 
-    // 3) Wait for the place panel
+    // 3) Wait for place panel to expose reviews UI
     await page.waitForSelector('button[aria-label*="reviews"], button[jsaction*="pane.reviewChart"]', { timeout: 20000 });
 
-    // 4) Open "All reviews"
+    // 4) Click "All reviews"
     const allReviewsBtn = page.locator('button[aria-label*="reviews"], button[jsaction*="pane.reviewChart"]');
     await allReviewsBtn.first().click({ timeout: 15000 });
 
-    // 5) Try to sort by "Newest"
+    // 5) Try to switch sort to "Newest"
     const sortButton = page.locator('button[aria-label*="Sort"], div[role="button"][aria-label*="Sort"]');
     if (await sortButton.first().isVisible().catch(()=>false)) {
       await sortButton.first().click({ timeout: 8000 }).catch(()=>{});
@@ -101,9 +99,9 @@ async function scrapeGoogleReviews({ name, location, maxReviews = 80, timeoutMs 
       }
     }
 
-    // 6) Scroll to load more reviews
+    // 6) Scroll the reviews container to load more
     const scroller = page.locator('div[aria-label*="Google reviews"], div[aria-label="Reviews"], div[role="region"]');
-    await scroller.first().waitFor({ timeout: 10000 });
+    await scroller.first().waitFor({ timeout: 12000 });
 
     let loaded = 0, stagnation = 0, lastCount = 0;
     while (loaded < maxReviews && Date.now() - start < timeoutMs) {
@@ -113,7 +111,7 @@ async function scrapeGoogleReviews({ name, location, maxReviews = 80, timeoutMs 
       if (count > lastCount) { lastCount = count; stagnation = 0; }
       else { stagnation += 1; }
 
-      // extract currently loaded review texts
+      // Extract currently rendered review texts
       const items = await reviewCards.evaluateAll(cards => {
         const arr = [];
         for (const el of cards) {
@@ -138,7 +136,7 @@ async function scrapeGoogleReviews({ name, location, maxReviews = 80, timeoutMs 
       await sleep(900);
     }
 
-    // 7) Try to copy a shareable place URL (nice-to-have)
+    // 7) Try to grab a share URL (optional)
     let placeUrl = "";
     try {
       const shareBtn = page.locator('button[aria-label*="Share"]');
@@ -159,10 +157,8 @@ async function scrapeGoogleReviews({ name, location, maxReviews = 80, timeoutMs 
   }
 }
 
-// ----------------------------------------------------------------------------
-// Route: /google-scrape  (FREE, Playwright-based)
-//   Query: ?name=...&location=...&max=80&keywords=security,pet%20waste
-// ----------------------------------------------------------------------------
+// Route: FREE Google scraper
+// Usage: /google-scrape?name=...&location=...&max=80&keywords=security,pet%20waste,loiter
 app.get("/google-scrape", async (req, res) => {
   try {
     const name = required(req.query, "name");
@@ -172,8 +168,7 @@ app.get("/google-scrape", async (req, res) => {
     const keywords = keywordsStr ? keywordsStr.split(",").map(s => s.trim()).filter(Boolean) : [];
 
     const cacheKey = `gs:${name}|${location}|${max}`;
-    const cached = getCache(cacheKey);
-    let base = cached;
+    let base = getCache(cacheKey);
     if (!base) {
       base = await scrapeGoogleReviews({ name, location, maxReviews: max, timeoutMs: 90000 });
       setCache(cacheKey, base);
@@ -187,13 +182,12 @@ app.get("/google-scrape", async (req, res) => {
     res.json(result);
   } catch (e) {
     console.error("google-scrape failed", e);
-    // Return an informative error so you can see what happened in the client
     res.status(500).json({ error: "google-scrape failed", message: e.message || String(e) });
   }
 });
 
 // ============================================================================
-// ApartmentRatings.com – best-effort HTML parse (no keys)
+// ApartmentRatings.com – best-effort HTML parse (no API key)
 // ============================================================================
 app.get("/apartmentratings", async (req, res) => {
   try {
@@ -220,7 +214,7 @@ app.get("/apartmentratings", async (req, res) => {
     $ = load(await pr.text());
 
     const out = [];
-    // NOTE: AR often renders via JS, so yields may be thin.
+    // NOTE: AR often renders with JS; expect sparse yields.
     $(".review__content, .review__text, .review-body").each((_, el) => {
       const text = $(el).text().trim();
       if (text && text.length > 30) out.push({ text, url: propertyUrl });
@@ -235,7 +229,7 @@ app.get("/apartmentratings", async (req, res) => {
 });
 
 // ============================================================================
-// Apartments.com – best-effort HTML parse (no keys)
+// Apartments.com – best-effort HTML parse (no API key)
 // ============================================================================
 app.get("/apartments-com", async (req, res) => {
   try {
@@ -280,6 +274,13 @@ app.get("/apartments-com", async (req, res) => {
     console.error(e);
     res.status(e.statusCode || 500).json({ error: "apartments-com failed" });
   }
+});
+
+// ============================================================================
+// Health check
+// ============================================================================
+app.get("/health", (req, res) => {
+  res.json({ ok: true, ts: Date.now() });
 });
 
 // ============================================================================
