@@ -58,30 +58,53 @@ async function scrapeGoogleReviews({ name, location, maxReviews = 80, timeoutMs 
   const context = await browser.newContext({
     ...devices["Desktop Chrome"],
     locale: "en-US",
-    geolocation: { latitude: 37.3382, longitude: -121.8863 },
+    geolocation: { latitude: 37.3382, longitude: -121.8863 }, // San Jose-ish
     permissions: ["geolocation"],
     userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"
   });
 
   const page = await context.newPage();
   const q = `${name} ${location}`.trim();
+
+  // Try multiple entry URLs — Maps sometimes behaves differently per variant.
   const searchVariants = [
     `https://www.google.com/maps/search/${encodeURIComponent(q)}?hl=en&gl=us`,
+    `https://www.google.com/maps/place/${encodeURIComponent(q)}?hl=en&gl=us`,
     `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(q)}&hl=en&gl=us`
   ];
 
-  // Helper: wait for "place" UI (either heading or any reviews button)
+  const wait = (ms) => new Promise(r => setTimeout(r, ms));
+
+  // Dismiss cookie consent if it appears (top-level or in iframe)
+  const maybeDismissConsent = async () => {
+    // try top-level
+    const topButtons = page.locator('button:has-text("Accept all"), button:has-text("I agree"), button:has-text("Accept")');
+    if (await topButtons.first().isVisible().catch(() => false)) {
+      await topButtons.first().click().catch(() => {});
+      await wait(800);
+      return;
+    }
+    // try iframe
+    const consentFrames = page.frames().filter(f => (f.url() || "").includes("consent"));
+    for (const f of consentFrames) {
+      const b = await f.$('button:has-text("Accept all"), button:has-text("I agree"), button:has-text("Accept")');
+      if (b) { await b.click().catch(() => {}); await wait(800); return; }
+    }
+  };
+
+  // Heuristic: do we see place UI / reviews affordance?
   const waitForPlaceUI = async (ms = 8000) => {
     return await Promise.race([
       page.waitForSelector('button[aria-label*="reviews"], button[jsaction*="pane.reviewChart"]', { timeout: ms }).then(() => true).catch(() => false),
+      page.waitForSelector('[role="tab"]:has-text("Reviews")', { timeout: ms }).then(() => true).catch(() => false),
       page.waitForSelector('h1[aria-level="1"], h1[role="heading"]', { timeout: ms }).then(() => true).catch(() => false)
     ]);
   };
 
-  // Try to open the first result if we land on a results list
   const tryOpenFirstResult = async () => {
     if (await waitForPlaceUI()) return true;
 
+    // Broad set of result selectors
     const candidates = [
       'a[data-result-id]:has(h3)',
       'a.hfpxzc',
@@ -98,6 +121,7 @@ async function scrapeGoogleReviews({ name, location, maxReviews = 80, timeoutMs 
       }
     }
 
+    // As a last resort, hit Enter in the search box
     const searchBox = page.locator('input[aria-label*="Search"]');
     if (await searchBox.first().isVisible().catch(() => false)) {
       await searchBox.first().press("Enter").catch(() => {});
@@ -106,7 +130,7 @@ async function scrapeGoogleReviews({ name, location, maxReviews = 80, timeoutMs 
     return false;
   };
 
-  // Click into reviews view (button, chart, or Reviews tab)
+  // Open the reviews view: All reviews button, chart, or Reviews tab
   const openReviews = async () => {
     const btns = [
       'button[aria-label*="reviews"]',
@@ -118,8 +142,7 @@ async function scrapeGoogleReviews({ name, location, maxReviews = 80, timeoutMs 
       const el = page.locator(sel).first();
       if (await el.isVisible().catch(() => false)) {
         await el.click({ timeout: 15000 }).catch(() => {});
-        await page.waitForTimeout(1500);
-        // if a modal opened, it still contains review cards, so just proceed
+        await wait(1200);
         return true;
       }
     }
@@ -131,20 +154,20 @@ async function scrapeGoogleReviews({ name, location, maxReviews = 80, timeoutMs 
     let onPlace = false;
     for (const url of searchVariants) {
       await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
+      await maybeDismissConsent().catch(() => {});
       onPlace = (await tryOpenFirstResult()) || (await waitForPlaceUI());
       if (onPlace) break;
     }
     if (!onPlace) throw new Error("Could not open a place page.");
 
-    // Open reviews
-    await openReviews();
+    await openReviews(); // best-effort; some UIs land directly in reviews
 
-    // Wait until we actually see review cards (handle multiple UIs)
+    // Wait for review cards to exist (cover several UIs)
     const cardSelectors = [
-      'div[data-review-id]',                       // common
-      '[aria-label="Review"]',                     // ARIA region
+      'div[data-review-id]',                         // modern card
+      '[aria-label="Review"]',                       // ARIA region
       'div[jscontroller][data-review-id]',
-      'div.section-review',                        // legacy
+      'div.section-review',                          // legacy
       'div[data-section-id="reviews"] div[role="article"]'
     ];
     let cardsLocator = null;
@@ -156,8 +179,7 @@ async function scrapeGoogleReviews({ name, location, maxReviews = 80, timeoutMs 
       }
     }
     if (!cardsLocator) {
-      // try a short wait then one more pass
-      await page.waitForTimeout(2000);
+      await wait(1500);
       for (const sel of cardSelectors) {
         const loc = page.locator(sel);
         if (await loc.first().isVisible({ timeout: 3000 }).catch(() => false)) {
@@ -168,7 +190,7 @@ async function scrapeGoogleReviews({ name, location, maxReviews = 80, timeoutMs 
     }
     if (!cardsLocator) throw new Error("Review cards not found");
 
-    // Find the nearest scrollable ancestor of the first review card
+    // Find nearest scrollable ancestor of the first card
     const scroller = await cardsLocator.first().evaluateHandle((el) => {
       function isScrollable(n){ return n && n.scrollHeight > n.clientHeight; }
       let cur = el;
@@ -176,7 +198,7 @@ async function scrapeGoogleReviews({ name, location, maxReviews = 80, timeoutMs 
       return cur && isScrollable(cur) ? cur : document.scrollingElement || document.body;
     });
 
-    // Sort menu → "Newest" (best effort)
+    // Try to sort by "Newest" (if such a menu exists)
     const sortBtn = page.locator('button[aria-label*="Sort"], div[role="button"][aria-label*="Sort"]');
     if (await sortBtn.first().isVisible().catch(()=>false)) {
       await sortBtn.first().click({ timeout: 8000 }).catch(()=>{});
@@ -186,18 +208,23 @@ async function scrapeGoogleReviews({ name, location, maxReviews = 80, timeoutMs 
       }
     }
 
-    // Scroll & collect
     const texts = new Set();
     let stagnation = 0, lastCount = 0;
 
     while (texts.size < maxReviews && Date.now() - start < timeoutMs) {
-      // Extract from each visible card (multiple patterns)
+      // Expand “More” buttons so we capture full text
+      await page.$$eval(
+        'button[aria-label^="More"], button:has-text("More")',
+        btns => btns.forEach(b => { try { b.click(); } catch {} })
+      ).catch(()=>{});
+
+      // Extract from each visible card (several patterns)
       const chunk = await cardsLocator.evaluateAll((nodes) => {
         const arr = [];
         for (const n of nodes) {
           const long = n.querySelector('span[jsname="fbQN7e"], span[class*="full-text"], div[data-review-text]');
           const short = n.querySelector('span[jsname="bN97Pc"], span[class*="snippet"], span[class*="review-text"]');
-          const alt = n.querySelector('[data-review-text], [itemprop="reviewBody"]');
+          const alt = n.querySelector('[data-review-text], [itemprop="reviewBody"], div[lang]');
           const t = (long?.innerText || short?.innerText || alt?.innerText || "").trim();
           if (t && t.length > 5) arr.push(t);
         }
@@ -211,12 +238,11 @@ async function scrapeGoogleReviews({ name, location, maxReviews = 80, timeoutMs 
       lastCount = countNow;
       if (texts.size >= maxReviews || stagnation >= 6) break;
 
-      // scroll the detected container
       await scroller.evaluate((el) => { el.scrollBy(0, el.scrollHeight); });
-      await page.waitForTimeout(1000);
+      await wait(900);
     }
 
-    // Try to fetch a shareable place URL (optional)
+    // Optional: get share URL
     let placeUrl = "";
     try {
       const shareBtn = page.locator('button[aria-label*="Share"]');
@@ -241,22 +267,29 @@ async function scrapeGoogleReviews({ name, location, maxReviews = 80, timeoutMs 
   }
 }
 
-
-
 // Route: FREE Google scraper
-// Usage: /google-scrape?name=...&location=...&max=80&keywords=security,pet%20waste,loiter
+// Usage:
+//   /google-scrape?name=...&location=...&max=80
+//   &timeout=180000
+//   &keywords=security,pet%20waste,loiter
+//   &nocache=1
 app.get("/google-scrape", async (req, res) => {
   try {
     const name = required(req.query, "name");
     const location = required(req.query, "location");
+
     const max = Math.min(parseInt(req.query.max || "80", 10) || 80, 200);
+    const timeout = Math.min(parseInt(req.query.timeout || "120000", 10) || 120000, 240000);
+    const noCache = String(req.query.nocache || "").trim() === "1";
+
     const keywordsStr = (req.query.keywords || "").toLowerCase();
     const keywords = keywordsStr ? keywordsStr.split(",").map(s => s.trim()).filter(Boolean) : [];
 
     const cacheKey = `gs:${name}|${location}|${max}`;
-    let base = getCache(cacheKey);
+    let base = noCache ? null : getCache(cacheKey);
+
     if (!base) {
-      base = await scrapeGoogleReviews({ name, location, maxReviews: max, timeoutMs: 90000 });
+      base = await scrapeGoogleReviews({ name, location, maxReviews: max, timeoutMs: timeout });
       setCache(cacheKey, base);
     }
 
@@ -271,6 +304,7 @@ app.get("/google-scrape", async (req, res) => {
     res.status(500).json({ error: "google-scrape failed", message: e.message || String(e) });
   }
 });
+
 
 // ============================================================================
 // ApartmentRatings.com – best-effort HTML parse (no API key)
