@@ -211,7 +211,7 @@ export default function App(){
             <div style={{fontWeight:600,marginBottom:8}}>
   Findings for {name || "(name)"}{location ? `, ${location}` : ""}
 </div>
-            <div style={{fontSize:13,color:"#475569",marginBottom:8"}}>
+            <div style={{ fontSize: 13, color: '#475569', marginBottom: 8 }}>
               Relevant sentences found: <b>{counts.total}</b>
               {" "}| Security: <b>{counts.security}</b>
               {" "}· Pet: <b>{counts.pet}</b>
