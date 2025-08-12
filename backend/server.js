@@ -39,21 +39,16 @@ function required(q, name) {
   return v;
 }
 
-// ---- helper: detect if Outscraper JSON actually contains review data ----
+// ---- detect if Outscraper JSON actually contains review data ----
 function hasReviewData(json) {
   if (!json) return false;
   if (Array.isArray(json)) return json.length > 0;
 
-  const arrays = [
-    json.data,
-    json.results,
-    json.reviews,
-    json.reviews_data,
-  ].filter(Array.isArray);
-
+  const arrays = [json.data, json.results, json.reviews, json.reviews_data].filter(
+    Array.isArray
+  );
   if (arrays.some((a) => a.length > 0)) return true;
 
-  // some payloads: { items: [{ reviews_data:[...] }, ...] }
   if (Array.isArray(json.items)) {
     for (const it of json.items) {
       if (Array.isArray(it?.reviews_data) && it.reviews_data.length > 0) return true;
@@ -63,52 +58,89 @@ function hasReviewData(json) {
   return false;
 }
 
-// ---- helper: poll Outscraper results until ready (handles 202 + Pending) ----
-async function pollOutscraper(requestUrl, headers, { maxWaitMs = 60000, intervalMs = 1500 } = {}) {
+// ---- normalize any Outscraper payload → [{ text, url }] ----
+function normalizeReviews(payload) {
+  const out = [];
+  const push = (rv, placeUrl) => {
+    const text =
+      (rv &&
+        (rv.text ||
+          rv.review_text ||
+          rv.snippet ||
+          rv.review ||
+          rv.content)) ||
+      "";
+    const t = String(text).trim();
+    if (!t) return;
+    const url = rv.review_link || rv.url || rv.review_url || placeUrl || "";
+    out.push({ text: t, url });
+  };
+
+  const blocks = [];
+  if (Array.isArray(payload)) blocks.push(...payload);
+  if (payload?.data) blocks.push(...payload.data);
+  if (payload?.results) blocks.push(...payload.results);
+  if (!blocks.length && (payload?.reviews_data || payload?.reviews)) blocks.push(payload);
+  if (!blocks.length && Array.isArray(payload?.items)) blocks.push(...payload.items);
+
+  for (const block of blocks) {
+    const placeUrl = block?.url || block?.place_link || "";
+    let reviews =
+      block?.reviews ||
+      block?.reviews_data ||
+      block?.reviewsData ||
+      block?.data ||
+      [];
+
+    if (!Array.isArray(reviews) && Array.isArray(block?.items)) {
+      reviews = block.items.flatMap((it) => it?.reviews_data || it?.reviews || []);
+    }
+
+    if (Array.isArray(reviews)) reviews.forEach((rv) => push(rv, placeUrl));
+  }
+
+  // dedupe by text
+  const seen = new Set();
+  const uniq = [];
+  for (const r of out) {
+    const k = r.text.toLowerCase();
+    if (k && !seen.has(k)) { seen.add(k); uniq.push(r); }
+  }
+  return uniq;
+}
+
+// ---- polling helper for results_location (handles long jobs) ----
+async function pollOutscraper(requestUrl, headers, { maxWaitMs = 120000, intervalMs = 2000 } = {}) {
   const started = Date.now();
   let lastJson = null;
 
   while (Date.now() - started < maxWaitMs) {
     const r = await fetch(requestUrl, { headers });
     const text = await r.text();
-    let json = null;
-    try { json = JSON.parse(text); } catch { /* ignore parse error */ }
+    let json = null; try { json = JSON.parse(text); } catch {}
     lastJson = json;
 
-    // Only return when we actually see data
     if (hasReviewData(json)) return json;
 
-    // If explicitly marked success/done but no data, still return (we'll normalize to [])
-    if (json && typeof json === "object") {
-      const s = String(json.status || "").toLowerCase();
-      if (s === "success" || s === "done" || s === "ok" || s === "completed") {
-        return json;
-      }
-    }
+    const s = String(json?.status || "").toLowerCase();
+    if (s === "error" || s === "failed") return json; // don’t loop forever
 
-    // Otherwise keep waiting (still pending)
     await new Promise((res) => setTimeout(res, intervalMs));
   }
-  // timeout: return whatever we last saw
   return lastJson;
 }
 
-// -----------------------------------------------------------------------------
-// Google reviews via Outscraper  →  returns [{ text, url }]
-// -----------------------------------------------------------------------------
-app.get("/google-reviews", async (req, res) => {
+// ====== GOOGLE REVIEWS (ASYNC JOB FLOW) ======
+
+// 1) Start job, return { id, results_location }
+app.get("/google-reviews/start", async (req, res) => {
   try {
     const name = required(req.query, "name");
     const location = required(req.query, "location");
-    const cacheKey = `g:${name}|${location}`;
-    const cached = getCache(cacheKey);
-    if (cached) return res.json(cached);
 
     if (!OUTSCRAPER_API_KEY) {
-      console.warn("[WARN] OUTSCRAPER_API_KEY missing; returning [].");
-      return res.json([]);
+      return res.status(400).json({ error: "OUTSCRAPER_API_KEY missing on server" });
     }
-
     const headers = { "X-API-KEY": OUTSCRAPER_API_KEY };
     const triggerUrl =
       `https://api.app.outscraper.com/maps/reviews?` +
@@ -119,86 +151,115 @@ app.get("/google-reviews", async (req, res) => {
         language: "en",
       });
 
-    // 1) Trigger job
-    const triggerResp = await fetch(triggerUrl, { headers });
-    const triggerText = await triggerResp.text();
-    let triggerJson = null;
-    try { triggerJson = JSON.parse(triggerText); } catch {}
+    const resp = await fetch(triggerUrl, { headers });
+    const text = await resp.text();
+    let json = null; try { json = JSON.parse(text); } catch {}
 
-    if (!triggerResp.ok) {
-      console.error("Outscraper trigger error", triggerResp.status, triggerText);
+    if (!resp.ok) {
+      console.error("Outscraper start error", resp.status, text);
+      return res.status(resp.status).json({ error: "start_failed", detail: text.slice(0, 500) });
+    }
+
+    const id = json?.id || null;
+    const results_location =
+      json?.results_location ||
+      json?.resultsLocation ||
+      (id ? `https://api.outscraper.cloud/requests/${id}` : null);
+
+    if (!results_location) {
+      return res.status(202).json({ status: "Pending", id });
+    }
+    res.status(202).json({ status: "Pending", id, results_location });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "google-reviews/start failed" });
+  }
+});
+
+// 2) Poll for result by id or results_location; when ready, return normalized array
+app.get("/google-reviews/result", async (req, res) => {
+  try {
+    const id = (req.query.id || "").trim();
+    const results_location = (req.query.results_location || "").trim();
+    if (!id && !results_location) {
+      return res.status(400).json({ error: "Missing id or results_location" });
+    }
+    if (!OUTSCRAPER_API_KEY) {
+      return res.status(400).json({ error: "OUTSCRAPER_API_KEY missing on server" });
+    }
+    const headers = { "X-API-KEY": OUTSCRAPER_API_KEY };
+    const url = results_location || `https://api.outscraper.cloud/requests/${id}`;
+
+    const payload = await pollOutscraper(url, headers);
+    if (!payload) return res.status(202).json({ status: "Pending" });
+
+    if (!hasReviewData(payload)) return res.json([]); // success but no data
+    const reviews = normalizeReviews(payload);
+    res.json(reviews);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "google-reviews/result failed" });
+  }
+});
+
+// 3) Backward-compatible "sync" route: try brief poll; if not ready, return Pending descriptor
+app.get("/google-reviews", async (req, res) => {
+  try {
+    const name = required(req.query, "name");
+    const location = required(req.query, "location");
+    const cacheKey = `g:${name}|${location}`;
+    const cached = getCache(cacheKey);
+    if (cached) return res.json(cached);
+
+    if (!OUTSCRAPER_API_KEY) return res.json([]);
+
+    // try cache first by firing start, then quick poll
+    const headers = { "X-API-KEY": OUTSCRAPER_API_KEY };
+    const startUrl =
+      `https://api.app.outscraper.com/maps/reviews?` +
+      qParam({
+        query: `${name} ${location}`,
+        reviewsLimit: "50",
+        reviewsSort: "newest",
+        language: "en",
+      });
+
+    const startResp = await fetch(startUrl, { headers });
+    const startText = await startResp.text();
+    let startJson = null; try { startJson = JSON.parse(startText); } catch {}
+
+    if (!startResp.ok) {
+      console.error("Outscraper sync start error", startResp.status, startText);
       return res.json([]);
     }
 
-    let finalJson = null;
-
-    // 2) Immediate data (rare)
-    if (hasReviewData(triggerJson)) {
-      finalJson = triggerJson;
-    } else {
-      // 3) Poll results_location (typical for 202 Pending)
-      const resultsUrl =
-        triggerJson?.results_location ||
-        triggerJson?.resultsLocation ||
-        triggerJson?.result_url ||
-        (triggerJson?.id ? `https://api.outscraper.cloud/requests/${triggerJson.id}` : null);
-
-      if (!resultsUrl) {
-        console.warn("[WARN] No results_location or id returned by Outscraper trigger.");
-        return res.json([]);
-      }
-      finalJson = await pollOutscraper(resultsUrl, headers);
+    if (hasReviewData(startJson)) {
+      const reviews = normalizeReviews(startJson);
+      setCache(cacheKey, reviews);
+      return res.json(reviews);
     }
 
-    // 4) Normalize to [{ text, url }]
-    const out = [];
-    const push = (rv, placeUrl) => {
-      const text =
-        (rv &&
-          (rv.text ||
-           rv.review_text ||
-           rv.snippet ||
-           rv.review ||
-           rv.content)) || "";
-      const t = String(text).trim();
-      if (!t) return;
-      const url = rv.review_link || rv.url || rv.review_url || placeUrl || "";
-      out.push({ text: t, url });
-    };
+    // brief poll (8s) for synchronous-ish experience
+    const resultsUrl =
+      startJson?.results_location ||
+      startJson?.resultsLocation ||
+      (startJson?.id ? `https://api.outscraper.cloud/requests/${startJson.id}` : null);
 
-    const blocks = [];
-    if (Array.isArray(finalJson)) blocks.push(...finalJson);
-    if (finalJson?.data) blocks.push(...finalJson.data);
-    if (finalJson?.results) blocks.push(...finalJson.results);
-    if (!blocks.length && (finalJson?.reviews_data || finalJson?.reviews)) blocks.push(finalJson);
-    if (!blocks.length && Array.isArray(finalJson?.items)) blocks.push(...finalJson.items);
+    if (!resultsUrl) return res.status(202).json({ status: "Pending" });
 
-    for (const block of blocks) {
-      const placeUrl = block?.url || block?.place_link || "";
-      let reviews =
-        block?.reviews ||
-        block?.reviews_data ||
-        block?.reviewsData ||
-        block?.data ||
-        [];
-
-      if (!Array.isArray(reviews) && Array.isArray(block?.items)) {
-        reviews = block.items.flatMap((it) => it?.reviews_data || it?.reviews || []);
-      }
-
-      if (Array.isArray(reviews)) reviews.forEach((rv) => push(rv, placeUrl));
+    const payload = await pollOutscraper(resultsUrl, headers, { maxWaitMs: 8000, intervalMs: 1500 });
+    if (hasReviewData(payload)) {
+      const reviews = normalizeReviews(payload);
+      setCache(cacheKey, reviews);
+      return res.json(reviews);
     }
 
-    // 5) Dedupe by text
-    const seen = new Set();
-    const unique = [];
-    for (const r of out) {
-      const k = r.text.toLowerCase();
-      if (k && !seen.has(k)) { seen.add(k); unique.push(r); }
-    }
-
-    setCache(cacheKey, unique);
-    res.json(unique);
+    // not ready yet → tell the client how to poll
+    return res.status(202).json({
+      status: "Pending",
+      id: startJson?.id || null,
+      results_location: resultsUrl
+    });
   } catch (e) {
     console.error(e);
     res.status(e.statusCode || 500).json({ error: "google-reviews failed" });
@@ -233,7 +294,6 @@ app.get("/apartmentratings", async (req, res) => {
     $ = load(await pr.text());
 
     const out = [];
-    // NOTE: AR often renders reviews client-side; selectors may return few/none.
     $(".review__content, .review__text, .review-body").each((_, el) => {
       const text = $(el).text().trim();
       if (text && text.length > 30) out.push({ text, url: propertyUrl });
@@ -355,6 +415,6 @@ const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
   console.log(`Proxy server running on port ${PORT}`);
   if (!OUTSCRAPER_API_KEY) {
-    console.log("[NOTE] Set OUTSCRAPER_API_KEY to enable /google-reviews (otherwise it returns []).");
+    console.log("[NOTE] Set OUTSCRAPER_API_KEY to enable /google-reviews.");
   }
 });
