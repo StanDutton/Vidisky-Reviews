@@ -5,6 +5,7 @@ import express from "express";
 import fetch from "node-fetch";
 import cors from "cors";
 import { load } from "cheerio";
+import { scrapeGoogleReviews } from "./scrapers/googleScraper.js";
 
 const app = express();
 app.use(cors());
@@ -177,6 +178,47 @@ async function fetchResultsUntilData(baseOrId, headers, { maxWaitMs = 180000, in
   }
   return lastJson;
 }
+// At top of server.js, after other imports:
+// import { scrapeGoogleReviews } from "./scrapers/googleScraper.js";
+
+// New endpoint: /google-scrape?name=...&location=...&max=80&since=2024-01-01&keywords=security,pet%20waste
+app.get("/google-scrape", async (req, res) => {
+  try {
+    const name = (req.query.name || "").trim();
+    const location = (req.query.location || "").trim();
+    if (!name || !location) return res.status(400).json({ error: "name and location required" });
+
+    const max = Math.min(parseInt(req.query.max || "80", 10) || 80, 200);
+    const sinceStr = (req.query.since || "").trim(); // YYYY-MM-DD (best-effort; Maps doesn’t give exact dates reliably)
+    const keywordsStr = (req.query.keywords || "").toLowerCase();
+    const keywords = keywordsStr ? keywordsStr.split(",").map(s => s.trim()).filter(Boolean) : [];
+
+    // tiny cache
+    const cacheKey = `gs:${name}|${location}|${max}`;
+    const cached = getCache(cacheKey);
+    if (cached) {
+      let filtered = cached;
+      if (keywords.length) {
+        filtered = filtered.filter(r => keywords.some(k => r.text.toLowerCase().includes(k)));
+      }
+      return res.json(filtered);
+    }
+
+    const reviews = await scrapeGoogleReviews({ name, location, maxReviews: max, timeoutMs: 90000 });
+
+    // (Optional) filter by keywords after scraping
+    let filtered = reviews;
+    if (keywords.length) {
+      filtered = reviews.filter(r => keywords.some(k => r.text.toLowerCase().includes(k)));
+    }
+
+    setCache(cacheKey, reviews);
+    res.json(filtered);
+  } catch (e) {
+    console.error("google-scrape failed", e);
+    res.json([]);
+  }
+});
 
 
 // --- replace ONLY the /google-reviews/result route with this robust version ---
