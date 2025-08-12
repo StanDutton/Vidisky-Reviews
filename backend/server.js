@@ -1,22 +1,19 @@
-// server.js – VIDISKY proxy (Outscraper + ApartmentRatings + Apartments.com)
+// server.js – VIDISKY proxy (Google scraper via Playwright + ApartmentRatings + Apartments.com)
 // Node 22, ESM
 
 import express from "express";
 import fetch from "node-fetch";
 import cors from "cors";
 import { load } from "cheerio";
-import { scrapeGoogleReviews } from "./scrapers/googleScraper.js";
+import { chromium, devices } from "playwright";
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ---------- config / helpers ----------
-const OUTSCRAPER_API_KEY =
-  process.env.OUTSCRAPER_API_KEY || process.env.OUTSCRAPER_KEY;
-
+// ---------- tiny cache ----------
 const cache = new Map();
-const TTL_MS = 1000 * 60 * 60 * 6; // 6h cache to reduce costs
+const TTL_MS = 1000 * 60 * 60 * 6; // 6h cache
 
 const getCache = (k) => {
   const x = cache.get(k);
@@ -29,7 +26,6 @@ const getCache = (k) => {
 };
 const setCache = (k, v) => cache.set(k, { ts: Date.now(), v });
 
-const qParam = (obj) => new URLSearchParams(obj).toString();
 function required(q, name) {
   const v = (q[name] || "").toString().trim();
   if (!v) {
@@ -40,304 +36,165 @@ function required(q, name) {
   return v;
 }
 
-// ---- detect if Outscraper JSON actually contains review data ----
-function hasReviewData(json) {
-  if (!json) return false;
-  if (Array.isArray(json)) return json.length > 0;
+// ============================================================================
+// GOOGLE MAPS SCRAPER (Playwright)
+// ============================================================================
 
-  const arrays = [json.data, json.results, json.reviews, json.reviews_data].filter(
-    Array.isArray
-  );
-  if (arrays.some((a) => a.length > 0)) return true;
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-  if (Array.isArray(json.items)) {
-    for (const it of json.items) {
-      if (Array.isArray(it?.reviews_data) && it.reviews_data.length > 0) return true;
-      if (Array.isArray(it?.reviews) && it.reviews.length > 0) return true;
-    }
-  }
-  return false;
-}
+/**
+ * scrapeGoogleReviews
+ * - Opens Google Maps for "{name} {location}"
+ * - Clicks first result → "All reviews"
+ * - Sorts by "Newest" (if available)
+ * - Scrolls to load up to maxReviews
+ * - Returns [{ text, url }]
+ */
+async function scrapeGoogleReviews({ name, location, maxReviews = 80, timeoutMs = 90000 }) {
+  const start = Date.now();
+  const browser = await chromium.launch({
+    headless: true,
+    args: [
+      "--no-sandbox",
+      "--disable-dev-shm-usage",
+      "--disable-gpu",
+      "--disable-blink-features=AutomationControlled"
+    ]
+  });
 
-// ---- normalize any Outscraper payload → [{ text, url }] ----
-function normalizeReviews(payload) {
+  const context = await browser.newContext({
+    ...devices["Desktop Chrome"],
+    locale: "en-US",
+    geolocation: { latitude: 27.4989, longitude: -82.5748 }, // arbitrary; helps Maps load
+    permissions: ["geolocation"],
+    userAgent:
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"
+  });
+
+  const page = await context.newPage();
+  const q = `${name} ${location}`.trim();
+  const mapsSearch = `https://www.google.com/maps/search/${encodeURIComponent(q)}`;
   const out = [];
-  const push = (rv, placeUrl) => {
-    const text =
-      (rv &&
-        (rv.text ||
-          rv.review_text ||
-          rv.snippet ||
-          rv.review ||
-          rv.content)) ||
-      "";
-    const t = String(text).trim();
-    if (!t) return;
-    const url = rv.review_link || rv.url || rv.review_url || placeUrl || "";
-    out.push({ text: t, url });
-  };
 
-  const blocks = [];
-  if (Array.isArray(payload)) blocks.push(...payload);
-  if (payload?.data) blocks.push(...payload.data);
-  if (payload?.results) blocks.push(...payload.results);
-  if (!blocks.length && (payload?.reviews_data || payload?.reviews)) blocks.push(payload);
-  if (!blocks.length && Array.isArray(payload?.items)) blocks.push(...payload.items);
+  try {
+    // 1) Open search
+    await page.goto(mapsSearch, { waitUntil: "domcontentloaded", timeout: 45000 });
 
-  for (const block of blocks) {
-    const placeUrl = block?.url || block?.place_link || "";
-    let reviews =
-      block?.reviews ||
-      block?.reviews_data ||
-      block?.reviewsData ||
-      block?.data ||
-      [];
+    // 2) Click first result in left panel (robust-ish selectors)
+    const firstCard = page.locator('a[data-result-id]:has(h3), a.hfpxzc');
+    await firstCard.first().click({ timeout: 20000 });
 
-    if (!Array.isArray(reviews) && Array.isArray(block?.items)) {
-      reviews = block.items.flatMap((it) => it?.reviews_data || it?.reviews || []);
+    // 3) Wait for the place panel
+    await page.waitForSelector('button[aria-label*="reviews"], button[jsaction*="pane.reviewChart"]', { timeout: 20000 });
+
+    // 4) Open "All reviews"
+    const allReviewsBtn = page.locator('button[aria-label*="reviews"], button[jsaction*="pane.reviewChart"]');
+    await allReviewsBtn.first().click({ timeout: 15000 });
+
+    // 5) Try to sort by "Newest"
+    const sortButton = page.locator('button[aria-label*="Sort"], div[role="button"][aria-label*="Sort"]');
+    if (await sortButton.first().isVisible().catch(()=>false)) {
+      await sortButton.first().click({ timeout: 8000 }).catch(()=>{});
+      const newest = page.locator('div[role="menuitem"]:has-text("Newest")');
+      if (await newest.first().isVisible().catch(()=>false)) {
+        await newest.first().click({ timeout: 8000 }).catch(()=>{});
+      }
     }
 
-    if (Array.isArray(reviews)) reviews.forEach((rv) => push(rv, placeUrl));
-  }
+    // 6) Scroll to load more reviews
+    const scroller = page.locator('div[aria-label*="Google reviews"], div[aria-label="Reviews"], div[role="region"]');
+    await scroller.first().waitFor({ timeout: 10000 });
 
-  // dedupe by text
-  const seen = new Set();
-  const uniq = [];
-  for (const r of out) {
-    const k = r.text.toLowerCase();
-    if (k && !seen.has(k)) { seen.add(k); uniq.push(r); }
-  }
-  return uniq;
-}
+    let loaded = 0, stagnation = 0, lastCount = 0;
+    while (loaded < maxReviews && Date.now() - start < timeoutMs) {
+      const reviewCards = page.locator('div[data-review-id], div[jscontroller][data-review-id]');
+      const count = await reviewCards.count().catch(()=>0);
 
-// ---- fetch JSON with key, return parsed or null ----
-async function fetchJson(url, headers) {
-  const r = await fetch(url, { headers });
-  const text = await r.text();
-  try { return JSON.parse(text); } catch { return null; }
-}
+      if (count > lastCount) { lastCount = count; stagnation = 0; }
+      else { stagnation += 1; }
 
-// --- replace the existing fetchResultsUntilData helper with this ---
-async function fetchJsonMaybe(url, headers, withHeader) {
-  const r = await fetch(url, withHeader ? { headers } : undefined);
-  const t = await r.text();
-  try { return JSON.parse(t); } catch { return null; }
-}
+      // extract currently loaded review texts
+      const items = await reviewCards.evaluateAll(cards => {
+        const arr = [];
+        for (const el of cards) {
+          const long = el.querySelector('span[jsname="fbQN7e"], span[class*="review-full-text"]');
+          const short = el.querySelector('span[jsname="bN97Pc"], span[class*="review-snippet"]');
+          const text = (long?.textContent || short?.textContent || "").trim();
+          if (text && text.length > 5) arr.push({ text });
+        }
+        return arr;
+      });
 
-async function fetchResultsUntilData(baseOrId, headers, { maxWaitMs = 180000, intervalMs = 2000 } = {}) {
-  const started = Date.now();
-  const id = baseOrId.startsWith('http') ? null : baseOrId;
-  const baseUrl = baseOrId.startsWith('http') ? baseOrId : `https://api.outscraper.cloud/requests/${id}`;
+      for (const it of items) {
+        const k = it.text.toLowerCase();
+        if (!out.some(x => x.text.toLowerCase() === k)) out.push(it);
+      }
+      loaded = out.length;
 
-  // Candidate URLs to try, in order, with & without header
-  const candidates = (u) => ([
-    u,
-    `${u.replace(/\/$/, '')}/results`,
-    // try the "app" domain too
-    u.replace('api.outscraper.cloud', 'api.app.outscraper.com'),
-    `${u.replace(/\/$/, '').replace('api.outscraper.cloud', 'api.app.outscraper.com')}/results`,
-  ]);
+      if (loaded >= maxReviews) break;
+      if (stagnation >= 6) break;
 
-  let lastJson = null;
+      await scroller.evaluate(el => { el.scrollBy(0, el.scrollHeight); });
+      await sleep(900);
+    }
 
-  while (Date.now() - started < maxWaitMs) {
-    // 1) Try all candidates (with and without header)
-    for (const url of candidates(baseUrl)) {
-      for (const withHeader of [true, false]) {
-        const json = await fetchJsonMaybe(url, headers, withHeader);
-        if (json) {
-          lastJson = json;
-          if (hasReviewData(json)) return json;
-
-          // Follow any links inside the payload
-          const linkFields = []
-            .concat(json.results_location || [])
-            .concat(json.resultsLocation || [])
-            .concat(json.result_url || [])
-            .concat(json.results_url || [])
-            .concat(json.file_url || [])
-            .concat(json.download_url || [])
-            .concat(Array.isArray(json.links) ? json.links : []);
-
-          for (const lf of linkFields) {
-            const link = typeof lf === 'string' ? lf : lf?.url || lf?.href;
-            if (!link) continue;
-            for (const wh of [true, false]) {
-              const j2 = await fetchJsonMaybe(link, headers, wh);
-              if (j2) {
-                lastJson = j2;
-                if (hasReviewData(j2)) return j2;
-                if (Array.isArray(j2) && j2.length) return j2; // some links return the array directly
-              }
-            }
-          }
+    // 7) Try to copy a shareable place URL (nice-to-have)
+    let placeUrl = "";
+    try {
+      const shareBtn = page.locator('button[aria-label*="Share"]');
+      if (await shareBtn.first().isVisible({ timeout: 2000 }).catch(()=>false)) {
+        await shareBtn.first().click().catch(()=>{});
+        const input = page.locator('input[aria-label="Link to share"]');
+        if (await input.first().isVisible().catch(()=>false)) {
+          placeUrl = await input.first().inputValue().catch(()=> "");
+          await page.keyboard.press("Escape").catch(()=>{});
         }
       }
-    }
-    await new Promise((r) => setTimeout(r, intervalMs));
+    } catch {}
+
+    return out.slice(0, maxReviews).map(r => ({ text: r.text, url: placeUrl || "" }));
+  } finally {
+    await context.close().catch(()=>{});
+    await browser.close().catch(()=>{});
   }
-  return lastJson;
 }
-// At top of server.js, after other imports:
-// import { scrapeGoogleReviews } from "./scrapers/googleScraper.js";
 
-// New endpoint: /google-scrape?name=...&location=...&max=80&since=2024-01-01&keywords=security,pet%20waste
+// ----------------------------------------------------------------------------
+// Route: /google-scrape  (FREE, Playwright-based)
+//   Query: ?name=...&location=...&max=80&keywords=security,pet%20waste
+// ----------------------------------------------------------------------------
 app.get("/google-scrape", async (req, res) => {
-  try {
-    const name = (req.query.name || "").trim();
-    const location = (req.query.location || "").trim();
-    if (!name || !location) return res.status(400).json({ error: "name and location required" });
-
-    const max = Math.min(parseInt(req.query.max || "80", 10) || 80, 200);
-    const sinceStr = (req.query.since || "").trim(); // YYYY-MM-DD (best-effort; Maps doesn’t give exact dates reliably)
-    const keywordsStr = (req.query.keywords || "").toLowerCase();
-    const keywords = keywordsStr ? keywordsStr.split(",").map(s => s.trim()).filter(Boolean) : [];
-
-    // tiny cache
-    const cacheKey = `gs:${name}|${location}|${max}`;
-    const cached = getCache(cacheKey);
-    if (cached) {
-      let filtered = cached;
-      if (keywords.length) {
-        filtered = filtered.filter(r => keywords.some(k => r.text.toLowerCase().includes(k)));
-      }
-      return res.json(filtered);
-    }
-
-    const reviews = await scrapeGoogleReviews({ name, location, maxReviews: max, timeoutMs: 90000 });
-
-    // (Optional) filter by keywords after scraping
-    let filtered = reviews;
-    if (keywords.length) {
-      filtered = reviews.filter(r => keywords.some(k => r.text.toLowerCase().includes(k)));
-    }
-
-    setCache(cacheKey, reviews);
-    res.json(filtered);
-  } catch (e) {
-    console.error("google-scrape failed", e);
-    res.json([]);
-  }
-});
-
-
-// --- replace ONLY the /google-reviews/result route with this robust version ---
-app.get("/google-reviews/result", async (req, res) => {
-  try {
-    const id = (req.query.id || "").trim();
-    const results_location = (req.query.results_location || "").trim();
-    if (!id && !results_location) {
-      return res.status(400).json({ error: "Missing id or results_location" });
-    }
-    if (!OUTSCRAPER_API_KEY) {
-      return res.status(400).json({ error: "OUTSCRAPER_API_KEY missing on server" });
-    }
-    const headers = { "X-API-KEY": OUTSCRAPER_API_KEY };
-    const handle = results_location || id;
-
-    const payload = await fetchResultsUntilData(handle, headers);
-    if (!payload) return res.status(202).json({ status: "Pending" });
-
-    if (!hasReviewData(payload)) return res.json([]); // success but no data
-    const reviews = normalizeReviews(payload);
-    res.json(reviews);
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: "google-reviews/result failed" });
-  }
-});
-
-
-// 2) Poll for result by id or results_location; when ready, return normalized array
-app.get("/google-reviews/result", async (req, res) => {
-  try {
-    const id = (req.query.id || "").trim();
-    const results_location = (req.query.results_location || "").trim();
-    if (!id && !results_location) {
-      return res.status(400).json({ error: "Missing id or results_location" });
-    }
-    if (!OUTSCRAPER_API_KEY) {
-      return res.status(400).json({ error: "OUTSCRAPER_API_KEY missing on server" });
-    }
-    const headers = { "X-API-KEY": OUTSCRAPER_API_KEY };
-    const base = results_location || `https://api.outscraper.cloud/requests/${id}`;
-
-    const payload = await fetchResultsUntilData(base, headers);
-    if (!payload) return res.status(202).json({ status: "Pending" });
-
-    if (!hasReviewData(payload)) return res.json([]); // success but no data
-    const reviews = normalizeReviews(payload);
-    res.json(reviews);
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: "google-reviews/result failed" });
-  }
-});
-
-// 3) Backward-compatible "sync" route: try brief poll; if not ready, return Pending descriptor
-app.get("/google-reviews", async (req, res) => {
   try {
     const name = required(req.query, "name");
     const location = required(req.query, "location");
-    const cacheKey = `g:${name}|${location}`;
+    const max = Math.min(parseInt(req.query.max || "80", 10) || 80, 200);
+    const keywordsStr = (req.query.keywords || "").toLowerCase();
+    const keywords = keywordsStr ? keywordsStr.split(",").map(s => s.trim()).filter(Boolean) : [];
+
+    const cacheKey = `gs:${name}|${location}|${max}`;
     const cached = getCache(cacheKey);
-    if (cached) return res.json(cached);
-
-    if (!OUTSCRAPER_API_KEY) return res.json([]);
-
-    const headers = { "X-API-KEY": OUTSCRAPER_API_KEY };
-    const startUrl =
-      `https://api.app.outscraper.com/maps/reviews?` +
-      qParam({
-        query: `${name} ${location}`,
-        reviewsLimit: "50",
-        reviewsSort: "newest",
-        language: "en",
-      });
-
-    const startResp = await fetch(startUrl, { headers });
-    const startText = await startResp.text();
-    let startJson = null; try { startJson = JSON.parse(startText); } catch {}
-
-    if (!startResp.ok) {
-      console.error("Outscraper sync start error", startResp.status, startText);
-      return res.json([]);
+    let base = cached;
+    if (!base) {
+      base = await scrapeGoogleReviews({ name, location, maxReviews: max, timeoutMs: 90000 });
+      setCache(cacheKey, base);
     }
 
-    if (hasReviewData(startJson)) {
-      const reviews = normalizeReviews(startJson);
-      setCache(cacheKey, reviews);
-      return res.json(reviews);
+    let result = base;
+    if (keywords.length) {
+      result = base.filter(r => keywords.some(k => r.text.toLowerCase().includes(k)));
     }
 
-    const resultsUrl =
-      startJson?.results_location ||
-      startJson?.resultsLocation ||
-      (startJson?.id ? `https://api.outscraper.cloud/requests/${startJson.id}` : null);
-
-    if (!resultsUrl) return res.status(202).json({ status: "Pending" });
-
-    const payload = await fetchResultsUntilData(resultsUrl, headers, { maxWaitMs: 8000, intervalMs: 1500 });
-    if (hasReviewData(payload)) {
-      const reviews = normalizeReviews(payload);
-      setCache(cacheKey, reviews);
-      return res.json(reviews);
-    }
-
-    return res.status(202).json({
-      status: "Pending",
-      id: startJson?.id || null,
-      results_location: resultsUrl
-    });
+    res.json(result);
   } catch (e) {
-    console.error(e);
-    res.status(e.statusCode || 500).json({ error: "google-reviews failed" });
+    console.error("google-scrape failed", e);
+    // Return an informative error so you can see what happened in the client
+    res.status(500).json({ error: "google-scrape failed", message: e.message || String(e) });
   }
 });
 
-// -----------------------------------------------------------------------------
-// ApartmentRatings.com (best-effort HTML parse)  → returns [{ text, url }]
-// -----------------------------------------------------------------------------
+// ============================================================================
+// ApartmentRatings.com – best-effort HTML parse (no keys)
+// ============================================================================
 app.get("/apartmentratings", async (req, res) => {
   try {
     const name = required(req.query, "name");
@@ -363,6 +220,7 @@ app.get("/apartmentratings", async (req, res) => {
     $ = load(await pr.text());
 
     const out = [];
+    // NOTE: AR often renders via JS, so yields may be thin.
     $(".review__content, .review__text, .review-body").each((_, el) => {
       const text = $(el).text().trim();
       if (text && text.length > 30) out.push({ text, url: propertyUrl });
@@ -376,9 +234,9 @@ app.get("/apartmentratings", async (req, res) => {
   }
 });
 
-// -----------------------------------------------------------------------------
-// Apartments.com (optional best-effort HTML parse)  → returns [{ text, url }]
-// -----------------------------------------------------------------------------
+// ============================================================================
+// Apartments.com – best-effort HTML parse (no keys)
+// ============================================================================
 app.get("/apartments-com", async (req, res) => {
   try {
     const name = required(req.query, "name");
@@ -393,7 +251,9 @@ app.get("/apartments-com", async (req, res) => {
     if (!sr.ok) return res.json([]);
     let $ = load(await sr.text());
 
-    const firstLink = $('a.placardTitle, a.property-link, a[data-tid="listing-card-title"]').first().attr("href");
+    const firstLink = $(
+      'a.placardTitle, a.property-link, a[data-tid="listing-card-title"]'
+    ).first().attr("href");
     if (!firstLink) return res.json([]);
     const propertyUrl = firstLink.startsWith("http")
       ? firstLink
@@ -422,66 +282,10 @@ app.get("/apartments-com", async (req, res) => {
   }
 });
 
-// -----------------------------------------------------------------------------
-// DEBUG endpoints (optional; remove once stable)
-// -----------------------------------------------------------------------------
-app.get("/env-check", (req, res) => {
-  const key = (process.env.OUTSCRAPER_API_KEY || "").trim();
-  res.json({
-    hasKey: Boolean(key),
-    keyPreview: key ? key.slice(0, 4) + "..." + key.slice(-4) : null,
-    nodeVersion: process.version,
-  });
-});
-
-// Show what the results URL(s) are returning right now
-app.get("/debug-google-result", async (req, res) => {
-  try {
-    const id = (req.query.id || "").trim();
-    const url = (req.query.url || "").trim();
-    if (!id && !url) {
-      return res.status(400).json({ error: "Provide ?id=... or ?url=..." });
-    }
-    if (!OUTSCRAPER_API_KEY) {
-      return res.status(400).json({ error: "OUTSCRAPER_API_KEY missing on server" });
-    }
-    const headers = { "X-API-KEY": OUTSCRAPER_API_KEY };
-    const base = url || `https://api.outscraper.cloud/requests/${id}`;
-
-    const tryUrls = [
-      base,
-      `${base.replace(/\/$/, "")}/results`
-    ];
-
-    const results = [];
-    for (const u of tryUrls) {
-      const r = await fetch(u, { headers });
-      const text = await r.text();
-      let json = null; try { json = JSON.parse(text); } catch {}
-      results.push({
-        url: u,
-        status: r.status,
-        hasData: hasReviewData(json),
-        preview: text.slice(0, 1200),
-        keys: json && !Array.isArray(json) ? Object.keys(json) : undefined,
-        isArray: Array.isArray(json),
-        length: Array.isArray(json) ? json.length : undefined
-      });
-    }
-    res.json({ tried: results });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: "debug-google-result failed", message: e.message });
-  }
-});
-
-// -----------------------------------------------------------------------------
+// ============================================================================
 // Start server
-// -----------------------------------------------------------------------------
+// ============================================================================
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
   console.log(`Proxy server running on port ${PORT}`);
-  if (!OUTSCRAPER_API_KEY) {
-    console.log("[NOTE] Set OUTSCRAPER_API_KEY to enable /google-reviews.");
-  }
 });
