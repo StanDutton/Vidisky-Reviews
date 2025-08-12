@@ -1,43 +1,79 @@
 import React, { useMemo, useRef, useState } from "react";
 
-// keywords we care about
-const KEYWORDS = [
-  "security","safety","unsafe","trespass","loiter","loitering","crime",
-  "stolen","break-in","broken into","burglary","vandal","police",
-  "weapon","gun","knife","assault","threatening",
-  "pet waste","dog poop","didn't pick up","did not pick up","feces",
-  "amenity misuse","pool party","after hours","after-hours","noise","loud",
-  "non-residents","illegal parking","trash dumping","package theft"
-];
+// --- categories & keywords ---
+const CATEGORIES = {
+  security: [
+    "security","unsafe","trespass","trespasser","loiter","loitering","crime",
+    "stolen","break-in","break in","broken into","burglary","vandal","vandalism",
+    "police","weapon","gun","knife","assault","threatening","suspicious",
+    "car break","catalytic","porch pirate"
+  ],
+  pet: [
+    "pet waste","dog poop","poop","didn't pick up","did not pick up","feces",
+    "droppings","dogs everywhere","mess from dogs","dog waste"
+  ],
+  noise: [
+    "amenity misuse","party","parties","pool party","after hours","after-hours",
+    "noise","noisy","loud","non-residents","guests using","gym crowd","smoking by pool",
+    "smoke at pool","parking unauthorized","illegal parking","trash dumping","dumpster",
+    "package theft","mailroom"
+  ]
+};
+
+// keep a flat list in case you need it elsewhere
+const ALL_KEYWORDS = [...new Set(Object.values(CATEGORIES).flat())];
 
 function tokenize(text){
-  return (text||"").replace(/\n+/g,"\n").split(/\n|\.|!|\?|\r/g).map(s=>s.trim()).filter(Boolean);
+  return (text||"")
+    .replace(/\n+/g,"\n")
+    .split(/\n|\.|!|\?|\r/g)
+    .map(s=>s.trim())
+    .filter(Boolean);
+}
+
+function classify(sentence){
+  const s = sentence.toLowerCase();
+  const hits = [];
+  for (const [cat, words] of Object.entries(CATEGORIES)){
+    if (words.some(w => s.includes(w))) hits.push(cat);
+  }
+  return hits;
 }
 
 export default function App(){
   const [name, setName] = useState("");
   const [location, setLocation] = useState("");
-  // ⬇️ default to your new backend URL
+  // default to your backend URL
   const [proxyBase, setProxyBase] = useState("https://vidisky-reviews-1.onrender.com");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [results, setResults] = useState([]); // [{text,url,source}]
   const reportRef = useRef(null);
 
+  // Extract per-sentence matches with categories
   const filtered = useMemo(()=>{
     const out=[];
     for(const r of results){
       for(const sentence of tokenize(r.text)){
-        const s = sentence.toLowerCase();
-        if (KEYWORDS.some(k => s.includes(k))){
-          out.push({ sentence, url:r.url, source:r.source });
+        const cats = classify(sentence);
+        if (cats.length){
+          out.push({ sentence, url:r.url, source:r.source, cats });
         }
       }
     }
     return out;
   },[results]);
 
-  const counts = useMemo(()=>({ total: filtered.length }),[filtered]);
+  // Counts per category + total
+  const counts = useMemo(()=>{
+    const base = { total: filtered.length, security:0, pet:0, noise:0 };
+    for (const row of filtered){
+      if (row.cats.includes("security")) base.security++;
+      if (row.cats.includes("pet")) base.pet++;
+      if (row.cats.includes("noise")) base.noise++;
+    }
+    return base;
+  },[filtered]);
 
   async function fetchJson(path){
     const base = proxyBase.replace(/\/$/, "");
@@ -55,7 +91,7 @@ export default function App(){
 
       const q = `?name=${encodeURIComponent(name)}&location=${encodeURIComponent(location)}`;
 
-      // ⬇️ Updated: use free scraper endpoint for Google, keep ApartmentRatings
+      // Google (Playwright scraper) + ApartmentRatings
       const [g, ar] = await Promise.allSettled([
         fetchJson(`/google-scrape${q}&max=80`),
         fetchJson(`/apartmentratings${q}`)
@@ -83,9 +119,16 @@ export default function App(){
     const lines=[];
     lines.push(`Subject: Quick security takeaways – ${name||"Property"} (${location||"City, ST"})`);
     lines.push(""); lines.push("Hi [Name] —"); lines.push("");
-    lines.push(`I pulled public reviews for ${name||"your community"} in ${location||"your area"} and filtered for security, pet waste, amenity misuse, and safety.`);
-    lines.push(`Signals found: ${counts.total}`); lines.push("");
-    filtered.slice(0,10).forEach(r=>lines.push(`– ${r.sentence}`));
+    lines.push(`I pulled public reviews for ${name||"your community"} in ${location||"your area"} and filtered for security, pet waste, and parties/noise.`);
+    lines.push(`Signals found: ${counts.total}`);
+    lines.push(`• Security: ${counts.security}`);
+    lines.push(`• Pet issues: ${counts.pet}`);
+    lines.push(`• Parties/Noise: ${counts.noise}`);
+    lines.push("");
+    filtered.slice(0,10).forEach(r=>{
+      const tag = r.cats.join(", ");
+      lines.push(`– ${r.sentence}  [${tag}]`);
+    });
     lines.push(""); lines.push("How we help (VIDISKY):");
     lines.push("• AI + live agents monitor your existing cameras in real time");
     lines.push("• Voice-down trespassers, alert staff, or call police per protocol");
@@ -149,20 +192,43 @@ export default function App(){
           <button onClick={exportPdf} style={{border:"1px solid #e2e8f0",borderRadius:10,padding:"8px 12px"}}>Export PDF</button>
         </div>
 
+        {/* Category counts */}
+        <div style={{display:"grid",gridTemplateColumns:"repeat(3, 1fr)",gap:8,marginTop:12}}>
+          {[
+            ["Security", counts.security],
+            ["Pet issues", counts.pet],
+            ["Parties/Noise", counts.noise],
+          ].map(([label,count])=>(
+            <div key={label} style={{...box, padding:12}}>
+              <div style={{fontSize:12,color:"#64748b"}}>{label}</div>
+              <div style={{fontWeight:700,fontSize:22}}>{count}</div>
+            </div>
+          ))}
+        </div>
+
         <div style={{display:"grid",gridTemplateColumns:"1fr",gap:16,marginTop:16}}>
           <div ref={reportRef} style={box}>
-            <div style={{fontWeight:600,marginBottom:8}}>Findings for {name||"(name)"}{location?`, ${location}`:""}</div>
-            <div style={{fontSize:13,color:"#475569",marginBottom:8}}>Relevant sentences found: <b>{counts.total}</b></div>
+            <div style={{fontWeight:600,marginBottom:8}}>
+              Findings for {name||"(name)"}{location?`, ${location}`:""}
+            </div>
+            <div style={{fontSize:13,color:"#475569",marginBottom:8"}}>
+              Relevant sentences found: <b>{counts.total}</b>
+              {" "}| Security: <b>{counts.security}</b>
+              {" "}· Pet: <b>{counts.pet}</b>
+              {" "}· Parties/Noise: <b>{counts.noise}</b>
+            </div>
             {error && <div style={{marginBottom:8,color:"#b91c1c"}}>{error}</div>}
             {!filtered.length ? (
               <div style={{fontSize:13,color:"#64748b"}}>No explicit mentions detected.</div>
             ) : (
               <ul style={{margin:"8px 0 0 18px"}}>
-                {filtered.slice(0,30).map((q,i)=>(
+                {filtered.slice(0,40).map((q,i)=>(
                   <li key={i} style={{marginBottom:6,fontSize:14,lineHeight:"20px"}}>
                     “{q.sentence}”
                     {q.url && <a href={q.url} target="_blank" rel="noreferrer" style={{color:"#64748b",textDecoration:"underline",marginLeft:6}}>source</a>}
-                    <span style={{color:"#94a3b8",fontSize:12}}> [{q.source}]</span>
+                    <span style={{color:"#94a3b8",fontSize:12,marginLeft:6}}>
+                      [{q.cats.join(", ")}]
+                    </span>
                   </li>
                 ))}
               </ul>
