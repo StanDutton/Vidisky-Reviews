@@ -1,18 +1,18 @@
-# backend/Dockerfile
+# Use Playwright's image (Chromium + OS deps included)
 FROM mcr.microsoft.com/playwright:v1.46.0-jammy
 
-# Create app dir
+# App directory
 WORKDIR /app
 
-# Install deps
+# Install production deps
 COPY package*.json ./
 RUN npm ci --omit=dev
 
 # Copy source
 COPY . .
 
-# Expose the port your Express server uses
+# Expose Express port
 EXPOSE 3001
 
-# Run the server
+# Start server
 CMD ["node", "server.js"]
