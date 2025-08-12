@@ -52,101 +52,193 @@ async function scrapeGoogleReviews({ name, location, maxReviews = 80, timeoutMs 
   const start = Date.now();
   const browser = await chromium.launch({
     headless: true,
-    args: [
-      "--no-sandbox",
-      "--disable-dev-shm-usage",
-      "--disable-gpu",
-      "--disable-blink-features=AutomationControlled"
-    ]
+    args: ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--disable-blink-features=AutomationControlled"]
   });
 
   const context = await browser.newContext({
     ...devices["Desktop Chrome"],
     locale: "en-US",
-    geolocation: { latitude: 37.3382, longitude: -121.8863 }, // San Jose area
+    geolocation: { latitude: 37.3382, longitude: -121.8863 },
     permissions: ["geolocation"],
-    userAgent:
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"
+    userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"
   });
 
   const page = await context.newPage();
   const q = `${name} ${location}`.trim();
-  const searchUrl = `https://www.google.com/maps/search/${encodeURIComponent(q)}?hl=en&gl=us`;
-
-  await page.goto(searchUrl, { timeout: 45000, waitUntil: "domcontentloaded" });
-
-  // Click into first search result if not already on a place page
-  const firstResultSel = [
-    'a[data-result-id]:has(h3)',
-    'a.hfpxzc',
-    '[role="feed"] a[href*="/place/"]',
-    'div[role="article"] a[href*="/place/"]'
+  const searchVariants = [
+    `https://www.google.com/maps/search/${encodeURIComponent(q)}?hl=en&gl=us`,
+    `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(q)}&hl=en&gl=us`
   ];
-  let foundResult = false;
-  for (const sel of firstResultSel) {
-    const el = page.locator(sel).first();
-    if (await el.isVisible().catch(() => false)) {
-      await el.click({ timeout: 8000 }).catch(() => {});
-      foundResult = true;
-      break;
-    }
-  }
-  if (foundResult) {
-    await page.waitForTimeout(4000);
-  }
 
-  // Click the "All reviews" or "Reviews" button
-  const reviewBtn = page.locator(
-    'button[aria-label*="reviews"], button[jsaction*="pane.reviewChart"]'
-  ).first();
-  if (await reviewBtn.isVisible().catch(() => false)) {
-    await reviewBtn.click({ timeout: 15000 }).catch(() => {});
-    await page.waitForTimeout(3000);
-  }
+  // Helper: wait for "place" UI (either heading or any reviews button)
+  const waitForPlaceUI = async (ms = 8000) => {
+    return await Promise.race([
+      page.waitForSelector('button[aria-label*="reviews"], button[jsaction*="pane.reviewChart"]', { timeout: ms }).then(() => true).catch(() => false),
+      page.waitForSelector('h1[aria-level="1"], h1[role="heading"]', { timeout: ms }).then(() => true).catch(() => false)
+    ]);
+  };
 
-  // Find the scrollable reviews container dynamically
-  const scrollerHandle = await page.evaluateHandle(() => {
-    const reviewEls = document.querySelectorAll('[aria-label^="Reviews"], [aria-label*="reviews"]');
-    if (reviewEls.length > 0) {
-      let el = reviewEls[0];
-      while (el && el.scrollHeight <= el.clientHeight) {
-        el = el.parentElement;
+  // Try to open the first result if we land on a results list
+  const tryOpenFirstResult = async () => {
+    if (await waitForPlaceUI()) return true;
+
+    const candidates = [
+      'a[data-result-id]:has(h3)',
+      'a.hfpxzc',
+      '[role="feed"] a[href*="/place/"]',
+      'div[role="article"] a[href*="/place/"]',
+      'a[aria-label][href*="/place/"]'
+    ];
+
+    for (const sel of candidates) {
+      const el = page.locator(sel).first();
+      if (await el.isVisible().catch(() => false)) {
+        await el.click({ timeout: 8000 }).catch(() => {});
+        if (await waitForPlaceUI()) return true;
       }
-      return el;
     }
-    // fallback: biggest scrollable div
-    let biggest = null;
-    document.querySelectorAll("div").forEach(d => {
-      if (d.scrollHeight > d.clientHeight) {
-        if (!biggest || d.scrollHeight > biggest.scrollHeight) biggest = d;
+
+    const searchBox = page.locator('input[aria-label*="Search"]');
+    if (await searchBox.first().isVisible().catch(() => false)) {
+      await searchBox.first().press("Enter").catch(() => {});
+      if (await waitForPlaceUI()) return true;
+    }
+    return false;
+  };
+
+  // Click into reviews view (button, chart, or Reviews tab)
+  const openReviews = async () => {
+    const btns = [
+      'button[aria-label*="reviews"]',
+      'button[jsaction*="pane.reviewChart"]',
+      '[role="tab"]:has-text("Reviews")',
+      'a[href*="reviews"]'
+    ];
+    for (const sel of btns) {
+      const el = page.locator(sel).first();
+      if (await el.isVisible().catch(() => false)) {
+        await el.click({ timeout: 15000 }).catch(() => {});
+        await page.waitForTimeout(1500);
+        // if a modal opened, it still contains review cards, so just proceed
+        return true;
       }
+    }
+    return false;
+  };
+
+  try {
+    // Navigate using variants until we’re on a place page
+    let onPlace = false;
+    for (const url of searchVariants) {
+      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
+      onPlace = (await tryOpenFirstResult()) || (await waitForPlaceUI());
+      if (onPlace) break;
+    }
+    if (!onPlace) throw new Error("Could not open a place page.");
+
+    // Open reviews
+    await openReviews();
+
+    // Wait until we actually see review cards (handle multiple UIs)
+    const cardSelectors = [
+      'div[data-review-id]',                       // common
+      '[aria-label="Review"]',                     // ARIA region
+      'div[jscontroller][data-review-id]',
+      'div.section-review',                        // legacy
+      'div[data-section-id="reviews"] div[role="article"]'
+    ];
+    let cardsLocator = null;
+    for (const sel of cardSelectors) {
+      const loc = page.locator(sel);
+      if (await loc.first().isVisible({ timeout: 3000 }).catch(() => false)) {
+        cardsLocator = loc;
+        break;
+      }
+    }
+    if (!cardsLocator) {
+      // try a short wait then one more pass
+      await page.waitForTimeout(2000);
+      for (const sel of cardSelectors) {
+        const loc = page.locator(sel);
+        if (await loc.first().isVisible({ timeout: 3000 }).catch(() => false)) {
+          cardsLocator = loc;
+          break;
+        }
+      }
+    }
+    if (!cardsLocator) throw new Error("Review cards not found");
+
+    // Find the nearest scrollable ancestor of the first review card
+    const scroller = await cardsLocator.first().evaluateHandle((el) => {
+      function isScrollable(n){ return n && n.scrollHeight > n.clientHeight; }
+      let cur = el;
+      while (cur && cur !== document.body && !isScrollable(cur)) cur = cur.parentElement;
+      return cur && isScrollable(cur) ? cur : document.scrollingElement || document.body;
     });
-    return biggest;
-  });
 
-  if (!scrollerHandle) throw new Error("Could not find reviews scroller");
+    // Sort menu → "Newest" (best effort)
+    const sortBtn = page.locator('button[aria-label*="Sort"], div[role="button"][aria-label*="Sort"]');
+    if (await sortBtn.first().isVisible().catch(()=>false)) {
+      await sortBtn.first().click({ timeout: 8000 }).catch(()=>{});
+      const newest = page.locator('div[role="menuitem"]:has-text("Newest")');
+      if (await newest.first().isVisible().catch(()=>false)) {
+        await newest.first().click({ timeout: 8000 }).catch(()=>{});
+      }
+    }
 
-  // Scroll to load reviews
-  let reviews = new Set();
-  while (reviews.size < maxReviews && Date.now() - start < timeoutMs) {
-    await scrollerHandle.evaluate(el => {
-      el.scrollBy(0, el.scrollHeight);
-    });
-    await page.waitForTimeout(1500);
+    // Scroll & collect
+    const texts = new Set();
+    let stagnation = 0, lastCount = 0;
 
-    const texts = await page.$$eval('div[aria-label="Review"] div[jscontroller] > div:last-child', els =>
-      els.map(e => e.innerText).filter(Boolean)
-    );
-    texts.forEach(t => reviews.add(t));
-    if (reviews.size >= maxReviews) break;
+    while (texts.size < maxReviews && Date.now() - start < timeoutMs) {
+      // Extract from each visible card (multiple patterns)
+      const chunk = await cardsLocator.evaluateAll((nodes) => {
+        const arr = [];
+        for (const n of nodes) {
+          const long = n.querySelector('span[jsname="fbQN7e"], span[class*="full-text"], div[data-review-text]');
+          const short = n.querySelector('span[jsname="bN97Pc"], span[class*="snippet"], span[class*="review-text"]');
+          const alt = n.querySelector('[data-review-text], [itemprop="reviewBody"]');
+          const t = (long?.innerText || short?.innerText || alt?.innerText || "").trim();
+          if (t && t.length > 5) arr.push(t);
+        }
+        return arr;
+      });
+
+      for (const t of chunk) texts.add(t);
+
+      const countNow = texts.size;
+      stagnation = countNow > lastCount ? 0 : (stagnation + 1);
+      lastCount = countNow;
+      if (texts.size >= maxReviews || stagnation >= 6) break;
+
+      // scroll the detected container
+      await scroller.evaluate((el) => { el.scrollBy(0, el.scrollHeight); });
+      await page.waitForTimeout(1000);
+    }
+
+    // Try to fetch a shareable place URL (optional)
+    let placeUrl = "";
+    try {
+      const shareBtn = page.locator('button[aria-label*="Share"]');
+      if (await shareBtn.first().isVisible({ timeout: 1500 }).catch(() => false)) {
+        await shareBtn.first().click().catch(() => {});
+        const input = page.locator('input[aria-label="Link to share"]');
+        if (await input.first().isVisible().catch(() => false)) {
+          placeUrl = await input.first().inputValue().catch(() => "");
+          await page.keyboard.press("Escape").catch(() => {});
+        }
+      }
+    } catch {}
+
+    await context.close().catch(()=>{});
+    await browser.close().catch(()=>{});
+
+    return Array.from(texts).slice(0, maxReviews).map(text => ({ text, url: placeUrl || searchVariants[0] }));
+  } catch (e) {
+    await context.close().catch(()=>{});
+    await browser.close().catch(()=>{});
+    throw e;
   }
-
-  await browser.close();
-  return Array.from(reviews).map(text => ({
-    text,
-    url: searchUrl,
-    source: "Google"
-  }));
 }
 
 
