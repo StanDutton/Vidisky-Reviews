@@ -17,7 +17,8 @@ function tokenize(text){
 export default function App(){
   const [name, setName] = useState("");
   const [location, setLocation] = useState("");
-  const [proxyBase, setProxyBase] = useState("https://vidisky-reviews.onrender.com"); // your Render URL
+  // ⬇️ default to your new backend URL
+  const [proxyBase, setProxyBase] = useState("https://vidisky-reviews-1.onrender.com");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [results, setResults] = useState([]); // [{text,url,source}]
@@ -53,8 +54,10 @@ export default function App(){
       setLoading(true);
 
       const q = `?name=${encodeURIComponent(name)}&location=${encodeURIComponent(location)}`;
+
+      // ⬇️ Updated: use free scraper endpoint for Google, keep ApartmentRatings
       const [g, ar] = await Promise.allSettled([
-        fetchJson(`/google-reviews${q}`),
+        fetchJson(`/google-scrape${q}&max=80`),
         fetchJson(`/apartmentratings${q}`)
       ]);
 
@@ -136,7 +139,7 @@ export default function App(){
         <div style={{marginTop:8}}>
           <label style={{display:"flex",flexDirection:"column",gap:6}}>
             <span style={label}>Proxy Base URL</span>
-            <input value={proxyBase} onChange={e=>setProxyBase(e.target.value)} placeholder="https://vidisky-reviews.onrender.com" style={{border:"1px solid #cbd5e1",borderRadius:8,padding:8}}/>
+            <input value={proxyBase} onChange={e=>setProxyBase(e.target.value)} placeholder="https://vidisky-reviews-1.onrender.com" style={{border:"1px solid #cbd5e1",borderRadius:8,padding:8}}/>
           </label>
         </div>
 
@@ -150,6 +153,7 @@ export default function App(){
           <div ref={reportRef} style={box}>
             <div style={{fontWeight:600,marginBottom:8}}>Findings for {name||"(name)"}{location?`, ${location}`:""}</div>
             <div style={{fontSize:13,color:"#475569",marginBottom:8}}>Relevant sentences found: <b>{counts.total}</b></div>
+            {error && <div style={{marginBottom:8,color:"#b91c1c"}}>{error}</div>}
             {!filtered.length ? (
               <div style={{fontSize:13,color:"#64748b"}}>No explicit mentions detected.</div>
             ) : (
