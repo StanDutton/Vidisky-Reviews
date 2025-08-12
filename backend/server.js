@@ -63,7 +63,7 @@ async function scrapeGoogleReviews({ name, location, maxReviews = 80, timeoutMs 
   const context = await browser.newContext({
     ...devices["Desktop Chrome"],
     locale: "en-US",
-    geolocation: { latitude: 27.4989, longitude: -82.5748 }, // arbitrary; helps Maps load quickly
+    geolocation: { latitude: 27.4989, longitude: -82.5748 },
     permissions: ["geolocation"],
     userAgent:
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"
@@ -71,25 +71,73 @@ async function scrapeGoogleReviews({ name, location, maxReviews = 80, timeoutMs 
 
   const page = await context.newPage();
   const q = `${name} ${location}`.trim();
-  const mapsSearch = `https://www.google.com/maps/search/${encodeURIComponent(q)}`;
+  const mapsSearchVariants = [
+    `https://www.google.com/maps/search/${encodeURIComponent(q)}?hl=en&gl=us`,
+    `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(q)}&hl=en&gl=us`,
+  ];
   const out = [];
 
+  const waitForPlaceUI = async () => {
+    return await Promise.race([
+      page.waitForSelector('button[aria-label*="reviews"], button[jsaction*="pane.reviewChart"]', { timeout: 8000 }).then(() => true).catch(() => false),
+      page.waitForSelector('h1[aria-level="1"], h1[role="heading"]', { timeout: 8000 }).then(() => true).catch(() => false),
+    ]);
+  };
+
+  const tryOpenFirstResult = async () => {
+    // If we’re already on a place page, bail early
+    if (await waitForPlaceUI()) return true;
+
+    // Known selectors for first result (Maps changes these often)
+    const candidates = [
+      'a[data-result-id]:has(h3)',     // common left-panel cards
+      'a.hfpxzc',                      // classic card link
+      '[role="feed"] a[href*="/place/"]',
+      'div[role="article"] a[href*="/place/"]',
+      'a[aria-label][href*="/place/"]',
+    ];
+
+    // A little scroll in case results are offscreen
+    const resultsPanel = page.locator('[role="feed"], div[aria-label*="Results"]');
+    if (await resultsPanel.first().isVisible().catch(()=>false)) {
+      try { await resultsPanel.evaluate(el => el.scrollTop = 0); } catch {}
+    }
+
+    for (const sel of candidates) {
+      const el = page.locator(sel).first();
+      if (await el.isVisible().catch(()=>false)) {
+        await el.click({ timeout: 8000 }).catch(()=>{});
+        if (await waitForPlaceUI()) return true;
+      }
+    }
+
+    // As a last resort, press Enter in the search box to open the top match
+    const searchBox = page.locator('input[aria-label*="Search"]');
+    if (await searchBox.first().isVisible().catch(()=>false)) {
+      await searchBox.first().press('Enter').catch(()=>{});
+      if (await waitForPlaceUI()) return true;
+    }
+    return false;
+  };
+
   try {
-    // 1) Open search
-    await page.goto(mapsSearch, { waitUntil: "domcontentloaded", timeout: 45000 });
+    // Try both URL variants until one loads something usable
+    let opened = false;
+    for (const url of mapsSearchVariants) {
+      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
+      opened = await tryOpenFirstResult();
+      if (opened) break;
 
-    // 2) Click the first left-panel result (handle a couple of DOM variants)
-    const firstCard = page.locator('a[data-result-id]:has(h3), a.hfpxzc');
-    await firstCard.first().click({ timeout: 20000 });
+      // Sometimes Maps immediately shows place page (no need to click a result)
+      if (await waitForPlaceUI()) { opened = true; break; }
+    }
+    if (!opened) throw new Error("Could not open a place page from results.");
 
-    // 3) Wait for place panel to expose reviews UI
-    await page.waitForSelector('button[aria-label*="reviews"], button[jsaction*="pane.reviewChart"]', { timeout: 20000 });
-
-    // 4) Click "All reviews"
+    // Click "All reviews"
     const allReviewsBtn = page.locator('button[aria-label*="reviews"], button[jsaction*="pane.reviewChart"]');
     await allReviewsBtn.first().click({ timeout: 15000 });
 
-    // 5) Try to switch sort to "Newest"
+    // Try to sort by "Newest"
     const sortButton = page.locator('button[aria-label*="Sort"], div[role="button"][aria-label*="Sort"]');
     if (await sortButton.first().isVisible().catch(()=>false)) {
       await sortButton.first().click({ timeout: 8000 }).catch(()=>{});
@@ -99,9 +147,20 @@ async function scrapeGoogleReviews({ name, location, maxReviews = 80, timeoutMs 
       }
     }
 
-    // 6) Scroll the reviews container to load more
-    const scroller = page.locator('div[aria-label*="Google reviews"], div[aria-label="Reviews"], div[role="region"]');
-    await scroller.first().waitFor({ timeout: 12000 });
+    // Scroll the reviews container to load more
+    const scrollers = [
+      'div[aria-label*="Google reviews"]',
+      'div[aria-label="Reviews"]',
+      'div[role="region"][aria-label*="reviews"]',
+    ];
+    let scroller = null;
+    for (const s of scrollers) {
+      const loc = page.locator(s);
+      if (await loc.first().isVisible().catch(()=>false)) { scroller = loc.first(); break; }
+    }
+    if (!scroller) throw new Error("Could not find reviews scroller.");
+
+    await scroller.waitFor({ timeout: 12000 });
 
     let loaded = 0, stagnation = 0, lastCount = 0;
     while (loaded < maxReviews && Date.now() - start < timeoutMs) {
@@ -111,7 +170,6 @@ async function scrapeGoogleReviews({ name, location, maxReviews = 80, timeoutMs 
       if (count > lastCount) { lastCount = count; stagnation = 0; }
       else { stagnation += 1; }
 
-      // Extract currently rendered review texts
       const items = await reviewCards.evaluateAll(cards => {
         const arr = [];
         for (const el of cards) {
@@ -133,10 +191,10 @@ async function scrapeGoogleReviews({ name, location, maxReviews = 80, timeoutMs 
       if (stagnation >= 6) break;
 
       await scroller.evaluate(el => { el.scrollBy(0, el.scrollHeight); });
-      await sleep(900);
+      await new Promise(r => setTimeout(r, 900));
     }
 
-    // 7) Try to grab a share URL (optional)
+    // Try to grab share URL (optional)
     let placeUrl = "";
     try {
       const shareBtn = page.locator('button[aria-label*="Share"]');
@@ -156,6 +214,7 @@ async function scrapeGoogleReviews({ name, location, maxReviews = 80, timeoutMs 
     await browser.close().catch(()=>{});
   }
 }
+
 
 // Route: FREE Google scraper
 // Usage: /google-scrape?name=...&location=...&max=80&keywords=security,pet%20waste,loiter
