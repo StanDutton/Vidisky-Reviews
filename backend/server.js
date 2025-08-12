@@ -242,6 +242,63 @@ app.get("/apartments-com", async (req, res) => {
     res.status(e.statusCode || 500).json({ error: "apartments-com failed" });
   }
 });
+// --- DEBUG: check env + raw Outscraper response (remove after diagnosing) ---
+
+// Quick env check (masks most of the key)
+app.get("/env-check", (req, res) => {
+  const key = (process.env.OUTSCRAPER_API_KEY || "").trim();
+  res.json({
+    hasKey: Boolean(key),
+    keyPreview: key ? key.slice(0, 4) + "..." + key.slice(-4) : null,
+    nodeVersion: process.version
+  });
+});
+
+// Dump raw Outscraper result so we can see the shape / status
+app.get("/debug-google", async (req, res) => {
+  try {
+    const name = required(req.query, "name");
+    const location = required(req.query, "location");
+
+    if (!process.env.OUTSCRAPER_API_KEY) {
+      return res.status(400).json({ error: "OUTSCRAPER_API_KEY missing on server" });
+    }
+
+    const requestUrl =
+      `https://api.app.outscraper.com/maps/reviews?` +
+      new URLSearchParams({
+        query: `${name} ${location}`,
+        reviewsLimit: "10",
+        reviewsSort: "newest",
+        language: "en",
+      }).toString();
+
+    const resp = await fetch(requestUrl, {
+      headers: { "X-API-KEY": process.env.OUTSCRAPER_API_KEY }
+    });
+
+    const contentType = resp.headers.get("content-type") || "";
+    let bodyText = await resp.text();
+    let parsed = null;
+    try { parsed = JSON.parse(bodyText); } catch {}
+
+    res.status(resp.status).json({
+      ok: resp.ok,
+      status: resp.status,
+      contentType,
+      requestUrl,
+      // Show a preview so we don't dump megabytes
+      bodyPreview: bodyText.slice(0, 2000),
+      // If JSON, show top-level keys
+      jsonType: parsed && (Array.isArray(parsed) ? "array" : typeof parsed),
+      jsonLength: parsed && (Array.isArray(parsed) ? parsed.length : undefined),
+      jsonKeys: parsed && !Array.isArray(parsed) ? Object.keys(parsed) : undefined
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "debug-google failed", message: e.message });
+  }
+});
 
 // -----------------------------------------------------------------------------
 // Start server
