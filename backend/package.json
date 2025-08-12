@@ -1,10 +1,9 @@
 {
   "name": "vidisky-reviews-backend",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "type": "module",
   "main": "server.js",
   "scripts": {
-    "postinstall": "npx playwright install --with-deps chromium",
     "start": "node server.js"
   },
   "dependencies": {
