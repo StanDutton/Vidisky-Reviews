@@ -1,5 +1,5 @@
 {
-  "name":"vidisky-reviews-frontend",
+  "name": "vidisky-reviews-frontend",
   "version": "1.0.0",
   "private": true,
   "scripts": {
@@ -8,18 +8,13 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "html2canvas": "^1.4.1",
+    "jspdf": "^2.5.1",
     "react": "^18.2.0",
     "react-dom": "^18.2.0"
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^4.0.0",
-    "vite": "^4.3.0"
+    "vite": "^4.0.0"
   }
-},
-"dependencies": {
-  "html2canvas": "^1.4.1",
-  "jspdf": "^2.5.1",
-  "react": "^18.2.0",
-  "react-dom": "^18.2.0"
 }
-
